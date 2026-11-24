@@ -1,0 +1,318 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 0
+        },
+        "id": "bf71179c",
+        "outputId": "961cbef7-d66a-4de1-c93d-6cb1f6fd95e7"
+      },
+      "source": [
+        "import numpy as np\n",
+        "import matplotlib.pyplot as plt\n",
+        "import tensorflow as tf\n",
+        "from tensorflow.keras import layers, models, optimizers\n",
+        "from sklearn.manifold import TSNE\n",
+        "\n",
+        "# Set random seed for reproducibility\n",
+        "np.random.seed(42)\n",
+        "tf.random.set_seed(42)\n",
+        "\n",
+        "# 1. Load MNIST Dataset\n",
+        "(x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()\n",
+        "\n",
+        "# Normalize and flatten images to range [0, 1] for Bernoulli RBM\n",
+        "x_train = x_train.reshape(-1, 784).astype('float32') / 255.0\n",
+        "x_test = x_test.reshape(-1, 784).astype('float32') / 255.0\n",
+        "\n",
+        "# Divide training set into Unlabeled (for pre-training) and Labeled (for fine-tuning)\n",
+        "# 1,000 labeled samples for supervised training\n",
+        "x_labeled = x_train[:1000]\n",
+        "y_labeled = y_train[:1000]\n",
+        "\n",
+        "# Unlabeled data contains all remaining training samples\n",
+        "x_unlabeled = x_train[1000:]\n",
+        "print(f\"Unlabeled training data shape: {x_unlabeled.shape}\")\n",
+        "print(f\"Labeled training data shape: {x_labeled.shape}\")"
+      ],
+      "execution_count": 4,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Unlabeled training data shape: (59000, 784)\n",
+            "Labeled training data shape: (1000, 784)\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "f1078815"
+      },
+      "source": [
+        "class RBM:\n",
+        "    def __init__(self, visible_dim, hidden_dim, learning_rate=0.01, k=1):\n",
+        "        self.visible_dim = visible_dim\n",
+        "        self.hidden_dim = hidden_dim\n",
+        "        self.learning_rate = learning_rate\n",
+        "        self.k = k # Number of Gibbs sampling steps\n",
+        "\n",
+        "        # Initialize weights and biases\n",
+        "        self.W = tf.Variable(tf.random.normal([visible_dim, hidden_dim], stddev=0.01), dtype=tf.float32)\n",
+        "        self.v_bias = tf.Variable(tf.zeros([visible_dim]), dtype=tf.float32)\n",
+        "        self.h_bias = tf.Variable(tf.zeros([hidden_dim]), dtype=tf.float32)\n",
+        "\n",
+        "    def sample_h_given_v(self, v):\n",
+        "        h_prob = tf.sigmoid(tf.matmul(v, self.W) + self.h_bias)\n",
+        "        h_sample = tf.cast(h_prob > tf.random.uniform(tf.shape(h_prob)), dtype=tf.float32)\n",
+        "        return h_prob, h_sample\n",
+        "\n",
+        "    def sample_v_given_h(self, h):\n",
+        "        v_prob = tf.sigmoid(tf.matmul(h, tf.transpose(self.W)) + self.v_bias)\n",
+        "        v_sample = tf.cast(v_prob > tf.random.uniform(tf.shape(v_prob)), dtype=tf.float32)\n",
+        "        return v_prob, v_sample\n",
+        "\n",
+        "    def train_step(self, v_batch):\n",
+        "        with tf.GradientTape() as tape:\n",
+        "            # Positive phase\n",
+        "            h0_prob, h0_sample = self.sample_h_given_v(v_batch)\n",
+        "\n",
+        "            # Negative phase (Contrastive Divergence - k)\n",
+        "            vk_sample = v_batch\n",
+        "            hk_sample = h0_sample\n",
+        "            for _ in range(self.k):\n",
+        "                vk_prob, vk_sample = self.sample_v_given_h(hk_sample)\n",
+        "                hk_prob, hk_sample = self.sample_h_given_v(vk_sample)\n",
+        "\n",
+        "            # Compute gradients approximation using CD\n",
+        "            positive_grad = tf.matmul(tf.transpose(v_batch), h0_prob)\n",
+        "            negative_grad = tf.matmul(tf.transpose(vk_prob), hk_prob)\n",
+        "\n",
+        "            # We approximate gradient ascent via custom updates\n",
+        "            dW = (positive_grad - negative_grad) / tf.cast(tf.shape(v_batch)[0], tf.float32)\n",
+        "            dv_bias = tf.reduce_mean(v_batch - vk_prob, axis=0)\n",
+        "            dh_bias = tf.reduce_mean(h0_prob - hk_prob, axis=0)\n",
+        "\n",
+        "        # Apply weight updates manually\n",
+        "        self.W.assign_add(self.learning_rate * dW)\n",
+        "        self.v_bias.assign_add(self.learning_rate * dv_bias)\n",
+        "        self.h_bias.assign_add(self.learning_rate * dh_bias)\n",
+        "\n",
+        "        # Return reconstruction error\n",
+        "        recon_error = tf.reduce_mean(tf.square(v_batch - vk_prob))\n",
+        "        return recon_error\n",
+        "\n",
+        "    def transform(self, v):\n",
+        "        # Return hidden probability representation\n",
+        "        return tf.sigmoid(tf.matmul(v, self.W) + self.h_bias)"
+      ],
+      "execution_count": 2,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/",
+          "height": 0
+        },
+        "id": "be21e8e1",
+        "outputId": "0a8959ac-d48b-4c70-82ec-1f52606c93ac"
+      },
+      "source": [
+        "# Greedy layer-wise training parameters\n",
+        "batch_size = 128\n",
+        "epochs_rbm1 = 10\n",
+        "epochs_rbm2 = 10\n",
+        "\n",
+        "# Create Datasets\n",
+        "train_dataset = tf.data.Dataset.from_tensor_slices(x_unlabeled).shuffle(10000).batch(batch_size)\n",
+        "\n",
+        "print(\"=== Training RBM 1 (784 -> 500) ===\")\n",
+        "rbm1 = RBM(visible_dim=784, hidden_dim=500, learning_rate=0.05, k=1)\n",
+        "for epoch in range(epochs_rbm1):\n",
+        "    errors = []\n",
+        "    for batch in train_dataset:\n",
+        "        err = rbm1.train_step(batch)\n",
+        "        errors.append(err.numpy())\n",
+        "    print(f\"Epoch {epoch+1}/{epochs_rbm1} - Reconstruction Error: {np.mean(errors):.4f}\")\n",
+        "\n",
+        "# Generate activations for the second RBM layer\n",
+        "hidden1_activations = []\n",
+        "for batch in tf.data.Dataset.from_tensor_slices(x_unlabeled).batch(batch_size):\n",
+        "    h_act = rbm1.transform(batch)\n",
+        "    hidden1_activations.append(h_act)\n",
+        "hidden1_activations = tf.concat(hidden1_activations, axis=0)\n",
+        "\n",
+        "rbm2_dataset = tf.data.Dataset.from_tensor_slices(hidden1_activations).shuffle(10000).batch(batch_size)\n",
+        "\n",
+        "print(\"\\n=== Training RBM 2 (500 -> 250) ===\")\n",
+        "rbm2 = RBM(visible_dim=500, hidden_dim=250, learning_rate=0.05, k=1)\n",
+        "for epoch in range(epochs_rbm2):\n",
+        "    errors = []\n",
+        "    for batch in rbm2_dataset:\n",
+        "        err = rbm2.train_step(batch)\n",
+        "        errors.append(err.numpy())\n",
+        "    print(f\"Epoch {epoch+1}/{epochs_rbm2} - Reconstruction Error: {np.mean(errors):.4f}\")"
+      ],
+      "execution_count": 3,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "=== Training RBM 1 (784 -> 500) ===\n",
+            "Epoch 1/10 - Reconstruction Error: 0.0387\n",
+            "Epoch 2/10 - Reconstruction Error: 0.0218\n",
+            "Epoch 3/10 - Reconstruction Error: 0.0176\n",
+            "Epoch 4/10 - Reconstruction Error: 0.0156\n",
+            "Epoch 5/10 - Reconstruction Error: 0.0144\n",
+            "Epoch 6/10 - Reconstruction Error: 0.0136\n",
+            "Epoch 7/10 - Reconstruction Error: 0.0130\n",
+            "Epoch 8/10 - Reconstruction Error: 0.0126\n",
+            "Epoch 9/10 - Reconstruction Error: 0.0123\n",
+            "Epoch 10/10 - Reconstruction Error: 0.0121\n",
+            "\n",
+            "=== Training RBM 2 (500 -> 250) ===\n",
+            "Epoch 1/10 - Reconstruction Error: 0.0472\n",
+            "Epoch 2/10 - Reconstruction Error: 0.0255\n",
+            "Epoch 3/10 - Reconstruction Error: 0.0190\n",
+            "Epoch 4/10 - Reconstruction Error: 0.0159\n",
+            "Epoch 5/10 - Reconstruction Error: 0.0141\n",
+            "Epoch 6/10 - Reconstruction Error: 0.0130\n",
+            "Epoch 7/10 - Reconstruction Error: 0.0123\n",
+            "Epoch 8/10 - Reconstruction Error: 0.0118\n",
+            "Epoch 9/10 - Reconstruction Error: 0.0114\n",
+            "Epoch 10/10 - Reconstruction Error: 0.0112\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "44adedf8"
+      },
+      "source": [
+        "# 2. Visualize learned weights of the first layer as image filters\n",
+        "weights_rbm1 = rbm1.W.numpy()\n",
+        "plt.figure(figsize=(10, 10))\n",
+        "for i in range(64):\n",
+        "    plt.subplot(8, 8, i + 1)\n",
+        "    plt.imshow(weights_rbm1[:, i].reshape(28, 28), cmap='gray')\n",
+        "    plt.axis('off')\n",
+        "plt.suptitle('First Layer Learned Filters (First 64 RBM Units)', fontsize=16)\n",
+        "plt.show()"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "32191092"
+      },
+      "source": [
+        "def build_classification_model():\n",
+        "    model = models.Sequential([\n",
+        "        layers.Input(shape=(784,)),\n",
+        "        layers.Dense(500, activation='sigmoid', name='layer1'),\n",
+        "        layers.Dense(250, activation='sigmoid', name='layer2'),\n",
+        "        layers.Dense(10, activation='softmax', name='classifier')\n",
+        "    ])\n",
+        "    return model\n",
+        "\n",
+        "# 3. Transfer DBN (RBMs) weights\n",
+        "dbn_model = build_classification_model()\n",
+        "\n",
+        "# Set pre-trained weights\n",
+        "dbn_model.get_layer('layer1').set_weights([rbm1.W.numpy(), rbm1.h_bias.numpy()])\n",
+        "dbn_model.get_layer('layer2').set_weights([rbm2.W.numpy(), rbm2.h_bias.numpy()])\n",
+        "\n",
+        "# Compile models\n",
+        "opt = optimizers.Adam(learning_rate=0.001)\n",
+        "dbn_model.compile(optimizer=opt, loss='sparse_categorical_crossentropy', metrics=['accuracy'])\n",
+        "\n",
+        "# 4. Train from Random Initialization for comparison\n",
+        "random_model = build_classification_model()\n",
+        "random_model.compile(optimizer=optimizers.Adam(learning_rate=0.001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])\n",
+        "\n",
+        "# Train both models with the 1,000 labeled dataset samples\n",
+        "print(\"=== Fine-tuning DBN Pre-trained Model ===\")\n",
+        "history_dbn = dbn_model.fit(x_labeled, y_labeled, validation_data=(x_test, y_test), epochs=30, batch_size=32, verbose=1)\n",
+        "\n",
+        "print(\"\\n=== Training Randomly Initialized Model ===\")\n",
+        "history_random = random_model.fit(x_labeled, y_labeled, validation_data=(x_test, y_test), epochs=30, batch_size=32, verbose=1)"
+      ],
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "id": "2ec5229c"
+      },
+      "source": [
+        "# 5. Compare Accuracy and Representational Feature space using t-SNE\n",
+        "plt.figure(figsize=(12, 5))\n",
+        "plt.plot(history_dbn.history['val_accuracy'], label='DBN Pre-trained + Fine-tuned (Val Acc)', color='blue')\n",
+        "plt.plot(history_random.history['val_accuracy'], label='Randomly Initialized (Val Acc)', color='orange')\n",
+        "plt.title('Validation Accuracy Comparison (1,000 Labeled Samples)')\n",
+        "plt.xlabel('Epochs')\n",
+        "plt.ylabel('Accuracy')\n",
+        "plt.legend()\n",
+        "plt.grid(True)\n",
+        "plt.show()\n",
+        "\n",
+        "# Extract intermediate representations (layer 2 outputs) for plotting\n",
+        "intermediate_dbn_model = models.Model(inputs=dbn_model.input, outputs=dbn_model.get_layer('layer2').output)\n",
+        "intermediate_rand_model = models.Model(inputs=random_model.input, outputs=random_model.get_layer('layer2').output)\n",
+        "\n",
+        "# Take subset of testing samples for t-SNE projection\n",
+        "x_test_subset = x_test[:1000]\n",
+        "y_test_subset = y_test[:1000]\n",
+        "\n",
+        "feats_dbn = intermediate_dbn_model.predict(x_test_subset)\n",
+        "feats_rand = intermediate_rand_model.predict(x_test_subset)\n",
+        "\n",
+        "tsne = TSNE(n_components=2, random_state=42)\n",
+        "proj_dbn = tsne.fit_transform(feats_dbn)\n",
+        "proj_rand = tsne.fit_transform(feats_rand)\n",
+        "\n",
+        "# Plot Latent Spaces\n",
+        "fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))\n",
+        "sc1 = ax1.scatter(proj_dbn[:, 0], proj_dbn[:, 1], c=y_test_subset, cmap='tab10', alpha=0.8, s=15)\n",
+        "ax1.set_title(\"2-D Projection of DBN Layer 2 representations\")\n",
+        "fig.colorbar(sc1, ax=ax1, ticks=range(10))\n",
+        "\n",
+        "sc2 = ax2.scatter(proj_rand[:, 0], proj_rand[:, 1], c=y_test_subset, cmap='tab10', alpha=0.8, s=15)\n",
+        "ax2.set_title(\"2-D Projection of Random Init Layer 2 representations\")\n",
+        "fig.colorbar(sc2, ax=ax2, ticks=range(10))\n",
+        "\n",
+        "plt.show()"
+      ],
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
